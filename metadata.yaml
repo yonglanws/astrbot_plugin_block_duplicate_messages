@@ -1,0 +1,6 @@
+name: astrbot_plugin_block_duplicate_messages
+display_name: 多Bot指令冲突解决器
+desc: 解决多Bot同时响应相同指令导致的刷屏问题，实现智能指令分发与屏蔽
+version: v1.0.0
+author: 慵懒午睡
+repo: https://github.com/yonglanws/astrbot_plugin_block_duplicate_messages
