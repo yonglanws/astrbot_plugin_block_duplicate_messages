@@ -54,6 +54,7 @@ def extract_command(message: str) -> Optional[str]:
     
     对于 / 开头的指令，提取指令名。
     对于包含URL的消息，提取URL作为标识。
+    对于JSON消息，提取JSON内容作为标识。
     对于普通消息，生成基于消息内容的哈希标识。
     
     Args:
@@ -72,6 +73,24 @@ def extract_command(message: str) -> Optional[str]:
         match = COMMAND_PATTERN.match(message)
         if match:
             return match.group(1)
+        return None
+    
+    # 如果是JSON消息（[JSON]前缀）
+    if message.startswith('[JSON]'):
+        json_content = message[6:]  # 移除[JSON]前缀
+        # 尝试从JSON内容中提取URL
+        url_pattern = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+')
+        urls = url_pattern.findall(json_content)
+        
+        if urls:
+            url = urls[0]
+            url = url.split('?')[0].split('#')[0]
+            return f"json_url_{hashlib.md5(url.encode()).hexdigest()[:8]}"
+        
+        # 没有URL，使用整个JSON内容
+        content = re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9]', '', json_content)[:50]
+        if content:
+            return f"json_{hashlib.md5(content.encode()).hexdigest()[:8]}"
         return None
     
     # 尝试提取URL（http:// 或 https:// 开头）

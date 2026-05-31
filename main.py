@@ -2,7 +2,6 @@
 
 from typing import AsyncGenerator, Any, Dict
 import time
-import hashlib
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
@@ -51,7 +50,6 @@ class BlockDuplicateMessagesPlugin(Star):
         
         try:
             self.config.validate()
-            logger.info(f"[BDM] 配置验证通过 | 策略={self.config.bot_selection_strategy} | 窗口={self.config.time_window}s")
         except ValueError as e:
             logger.warning(f"[BDM] 配置验证失败，使用默认值: {e}")
             self.config = PluginConfig()
@@ -100,7 +98,6 @@ class BlockDuplicateMessagesPlugin(Star):
                 self._current_bot_id = f"bot_{id(self)}"
                 self._current_bot_name = f"Bot_{id(self) % 10000}"
             
-            logger.info(f"[BDM] Bot身份初始化 | id={self._current_bot_id} | name={self._current_bot_name}")
                 
         except Exception as e:
             logger.warning(f"[BDM] 获取Bot身份失败，使用默认值: {e}")
@@ -161,6 +158,8 @@ class BlockDuplicateMessagesPlugin(Star):
     def _generate_command_key(self, group_id: str, command: str, sender_id: str) -> str:
         """生成唯一的命令键
         
+        使用简单字符串拼接替代MD5哈希，减少CPU计算。
+        
         Args:
             group_id: 群组ID
             command: 指令标识
@@ -169,8 +168,7 @@ class BlockDuplicateMessagesPlugin(Star):
         Returns:
             唯一的命令键
         """
-        raw_key = f"{group_id}:{command}:{sender_id}"
-        return hashlib.md5(raw_key.encode()).hexdigest()[:16]
+        return f"{group_id}:{command}:{sender_id}"
 
     def _cleanup_expired_commands(self):
         """清理过期的命令记录"""
@@ -200,14 +198,41 @@ class BlockDuplicateMessagesPlugin(Star):
         except Exception as e:
             logger.error(f"[BDM] 处理消息时出错: {e}", exc_info=True)
 
+    def _extract_message_content(self, event: AstrMessageEvent) -> str:
+        """提取消息内容，支持多种组件类型
+        
+        Args:
+            event: 消息事件对象
+            
+        Returns:
+            消息内容字符串
+        """
+        # 首先尝试获取普通文本
+        message_str = (event.message_str or "").strip()
+        if message_str:
+            return message_str
+        
+        # 检查消息链中的JSON组件
+        if hasattr(event.message_obj, 'message') and event.message_obj.message:
+            for component in event.message_obj.message:
+                # 检查是否为JSON组件
+                comp_type = getattr(component, 'type', None)
+                if comp_type and 'json' in str(comp_type).lower():
+                    # 提取JSON内容
+                    json_content = getattr(component, 'data', None) or getattr(component, 'content', None)
+                    if json_content:
+                        return f"[JSON]{json_content}"
+        
+        return ""
+
     async def _handle_message(self, event: AstrMessageEvent):
         """处理单条消息的核心逻辑
         
         Args:
             event: 消息事件对象
         """
-        # 获取基本信息
-        message_str = (event.message_str or "").strip()
+        # 获取消息内容（支持文本、JSON等多种类型）
+        message_str = self._extract_message_content(event)
         if not message_str:
             return
         
@@ -217,7 +242,7 @@ class BlockDuplicateMessagesPlugin(Star):
             return
         
         # 根据屏蔽模式决定是否处理
-        is_command_msg = message_str.startswith('/')
+        is_command_msg = message_str.startswith('/') or message_str.startswith('[JSON]')
         if self.config.block_mode == "command" and not is_command_msg:
             return
         
@@ -230,8 +255,6 @@ class BlockDuplicateMessagesPlugin(Star):
         
         # 过滤掉Bot自己发送的消息
         if not self._is_user_message(event):
-            if self.config.enable_logging:
-                logger.debug(f"[BDM] 忽略Bot消息 | group={group_id}")
             return
         
         # 获取当前Bot ID
@@ -239,10 +262,6 @@ class BlockDuplicateMessagesPlugin(Star):
         
         # 生成唯一命令键
         command_key = self._generate_command_key(group_id, command, sender_id)
-        
-        # 清理过期记录（定期执行）
-        if len(self._processing_commands) > self.config.max_cache_size // 10:
-            self._cleanup_expired_commands()
         
         current_time = time.time()
         
@@ -253,14 +272,6 @@ class BlockDuplicateMessagesPlugin(Star):
             
             if time_diff <= self.config.time_window:
                 # 在时间窗口内，阻止后续Bot
-                if self.config.enable_logging:
-                    logger.info(format_log_message("指令被屏蔽", {
-                        "command": command,
-                        "group": group_id,
-                        "sender": sender_id,
-                        "bot": bot_id,
-                        "reason": "已有Bot处理中"
-                    }))
                 self._stats['total_blocked'] += 1
                 event.stop_event()
                 return
@@ -271,14 +282,10 @@ class BlockDuplicateMessagesPlugin(Star):
         # 第一个到达的Bot执行
         self._processing_commands[command_key] = current_time
         
-        if self.config.enable_logging:
-            logger.info(format_log_message("指令放行", {
-                "command": command,
-                "group": group_id,
-                "sender": sender_id,
-                "bot": bot_id,
-                "reason": "首个到达"
-            }))
+        # 定期清理过期记录（每100次操作清理一次）
+        if self._stats['total_allowed'] % 100 == 0:
+            self._cleanup_expired_commands()
+        
         self._stats['total_allowed'] += 1
 
     @filter.command("bdm_status")
