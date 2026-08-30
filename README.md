@@ -175,20 +175,13 @@ astrbot_plugin_block_duplicate_messages/
 
 ## 📝 更新日志
 
-### v1.0.0 (2026-04-14)
-- ✨ 初始版本发布
-- ✨ 支持时间窗口冲突检测
-- ✨ 支持三种Bot选择策略
-- ✨ 支持详细的日志记录和统计
-- ✨ 支持WebUI可视化配置
-
 ## 🤝 贡献
 
 欢迎提交 Issue 和 Pull Request！
 
 ## 📄 许可证
 
-本项目采用 [MIT](LICENSE) 许可证。
+本项目采用 [AGPLv3](LICENSE) 许可证。
 
 ## 🔗 相关链接
 
@@ -198,4 +191,4 @@ astrbot_plugin_block_duplicate_messages/
 
 ---
 
-**Made with ❤️ by yaohewoma**
+**Made with ❤️ by 慵懒午睡**
