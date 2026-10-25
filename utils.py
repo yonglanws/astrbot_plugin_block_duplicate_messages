@@ -85,12 +85,12 @@ def extract_command(message: str) -> Optional[str]:
         if urls:
             url = urls[0]
             url = url.split('?')[0].split('#')[0]
-            return f"json_url_{hashlib.md5(url.encode()).hexdigest()[:8]}"
-        
+            return f"json_url_{hashlib.sha256(url.encode()).hexdigest()[:8]}"
+
         # 没有URL，使用整个JSON内容
         content = re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9]', '', json_content)[:50]
         if content:
-            return f"json_{hashlib.md5(content.encode()).hexdigest()[:8]}"
+            return f"json_{hashlib.sha256(content.encode()).hexdigest()[:8]}"
         return None
     
     # 尝试提取URL（http:// 或 https:// 开头）
@@ -103,15 +103,60 @@ def extract_command(message: str) -> Optional[str]:
         url = urls[0]
         # 移除URL中的跟踪参数（如抖音的分享参数）
         url = url.split('?')[0].split('#')[0]
-        return f"url_{hashlib.md5(url.encode()).hexdigest()[:8]}"
+        return f"url_{hashlib.sha256(url.encode()).hexdigest()[:8]}"
     
     # 对于普通消息，使用前50个字符作为标识（去除空格和特殊字符）
     # 保留中文、英文、数字
     content = re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9]', '', message)[:50]
     if content:
-        return f"msg_{hashlib.md5(content.encode()).hexdigest()[:8]}"
+        return f"msg_{hashlib.sha256(content.encode()).hexdigest()[:8]}"
     
     return None
+
+
+# 官方 API 消息中可能残留的 @ 标记格式：
+# <@!xxx> / <@xxx> / <qqbot-at-user id="xxx" />
+OFFICIAL_MENTION_PATTERN: re.Pattern = re.compile(
+    r"<@!?[A-Za-z0-9+/=_-]+>|<qqbot-at-user[^>]*/>"
+)
+
+
+def normalize_content(message: str) -> str:
+    """跨平台消息内容归一化
+
+    不同平台对同一条消息的文本表示存在细微差异：
+    - QQ 官方 API 可能残留 <@!xxx> 形式的 @ 标记
+    - @ 消息段被剥离后可能留下多余的前导/重复空格
+    - OneBot 侧每个文本段会被独立 strip，空格分布可能不同
+
+    归一化后用于生成跨平台内容指纹。
+
+    Args:
+        message: 原始消息文本
+
+    Returns:
+        归一化后的消息文本
+    """
+    if not message:
+        return ""
+    text = OFFICIAL_MENTION_PATTERN.sub(" ", message)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def content_fingerprint(message: str) -> str:
+    """生成跨平台消息内容指纹
+
+    Args:
+        message: 原始消息文本
+
+    Returns:
+        归一化内容的指纹字符串，内容为空时返回空字符串
+    """
+    normalized = normalize_content(message)
+    if not normalized:
+        return ""
+    return hashlib.sha256(normalized.encode()).hexdigest()[:16]
 
 
 def generate_command_key(group_id: str, command: str, sender_id: str) -> str:
@@ -126,7 +171,7 @@ def generate_command_key(group_id: str, command: str, sender_id: str) -> str:
         唯一的指令键
     """
     raw_key = f"{group_id}:{command}:{sender_id}"
-    return hashlib.md5(raw_key.encode()).hexdigest()[:16]
+    return hashlib.sha256(raw_key.encode()).hexdigest()[:16]
 
 
 def get_current_timestamp() -> float:

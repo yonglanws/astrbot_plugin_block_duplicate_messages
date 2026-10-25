@@ -1,544 +1,373 @@
-"""指令冲突检测管理器"""
+"""双层消息去重引擎
+
+层1（同会话精确去重）：以 群ID+指令标识+发送者ID 为键，处理同一平台多账号
+（如多个 OneBot v11 连接）同时收到同一消息的场景。此层 ID 语义在同平台内
+一致，可精确匹配。
+
+层2（跨平台指纹去重）：以归一化消息内容指纹为键，处理 OneBot v11 与
+QQ 官方 API（qq_official / qq_official_webhook）等不同平台共处同一群聊时
+的同消息多响应冲突。由于跨平台的群/用户标识完全不可对应（数字群号/QQ号
+vs group_openid/member_openid，且官方 openid 每个应用各不相同），此层只能
+依赖内容指纹+时间窗匹配，并通过群名锚定降低不同群同文本的误判率。
+
+唤醒分级（woken）：
+- 强记录：消息会唤醒机器人（唤醒前缀 / @本机 / 引用本机），机器人将真正
+  响应。强记录可拦截任何后续匹配事件。
+- 弱记录：消息不会唤醒机器人（如 @ 的是群里其他 bot），机器人自身不会
+  响应。弱记录只拦截同样不会唤醒的后续事件——否则会出现"先到的无关事件
+  压制了真正被 @ 的机器人的响应"导致全员沉默。
+"""
 
 import asyncio
-import random
-import hashlib
 from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple, Any
-from datetime import datetime
 
 from astrbot.api import logger
 
 from .constants import (
-    BotSelectionStrategy,
-    DEFAULT_TIME_WINDOW,
-    DEFAULT_MAX_CACHE_SIZE,
-    DEFAULT_CLEANUP_INTERVAL,
-    COMMAND_CACHE_TTL
+    GROUP_NAME_CACHE_TTL,
+    GROUP_NAME_FAILURE_TTL,
+    GROUP_NAME_RESOLVE_TIMEOUT,
+    SWEEP_INTERVAL_OPS,
 )
-from .models import (
-    CommandRecord,
-    ConflictEvent,
-    PluginConfig,
-    BotInfo,
-    CommandStatus
-)
+from .models import FingerprintRecord, MessageInfo, PluginConfig
 from .utils import (
+    content_fingerprint,
+    format_log_message,
     generate_command_key,
     get_current_timestamp,
-    format_log_message
 )
 
 
-class ConflictDetectionManager:
-    """指令冲突检测管理器
-    
-    负责检测多Bot环境下的指令冲突，并协调Bot的选择和屏蔽逻辑。
-    
-    核心设计：使用基于消息哈希的确定性选择策略，确保所有Bot独立做出一致决策。
-    
-    Attributes:
-        config: 插件配置
-        _command_cache: 指令缓存（OrderedDict实现LRU）
-        _bot_registry: Bot注册表
-        _round_robin_counter: 轮询计数器（基于时间窗口）
-        _conflict_history: 冲突历史记录
-        _lock: 异步锁
-        _cleanup_task: 清理任务
-        _current_bot_id: 当前Bot ID
+class DuplicateMessageFilter:
+    """消息去重过滤器：同会话层 + 跨平台指纹层
+
+    所有平台事件进入插件处理器时调用 check()，得到放行/拦截结论。
+    事件由 AstrBot 并发处理，因此判定与记录都在 asyncio.Lock 内完成；
+    唯一的例外是决策延迟等待（platform_priority + decision_delay_ms），
+    等待期间不持锁，让更高优先级平台的事件有机会先登记。
     """
-    
-    def __init__(self, config: PluginConfig, current_bot_id: str = ""):
-        """初始化管理器
-        
-        Args:
-            config: 插件配置对象
-            current_bot_id: 当前Bot的ID
-        """
+
+    def __init__(self, config: PluginConfig, context: Any = None):
         self.config = config
-        self._current_bot_id = current_bot_id
-        
-        self._command_cache: OrderedDict[str, CommandRecord] = OrderedDict()
-        self._bot_registry: Dict[str, BotInfo] = {}
-        self._round_robin_counter: Dict[str, int] = {}
-        self._conflict_history: List[ConflictEvent] = []
-        self._max_history_size = 1000
-        
+        self._context = context
+
         self._lock = asyncio.Lock()
-        self._cleanup_task = None
-        self._running = False
+        # 层1：command_key -> (timestamp, woken)
+        self._layer1: Dict[str, Tuple[float, bool]] = {}
+        # 层2：内容指纹 -> 记录列表（LRU）
+        self._fingerprints: OrderedDict[str, List[FingerprintRecord]] = OrderedDict()
+        # 群名解析缓存：group_key -> (过期时间, 群名或空串)
+        self._group_name_cache: Dict[str, Tuple[float, str]] = {}
+        self._ops_since_sweep = 0
 
-    async def start(self):
-        """启动管理器"""
-        self._running = True
-        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
-        logger.info(f"指令冲突检测管理器已启动 | Bot={self._current_bot_id} | 策略={self.config.bot_selection_strategy} | 时间窗口={self.config.time_window}s")
-
-    async def terminate(self):
-        """停止管理器并清理资源"""
-        self._running = False
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
-            try:
-                await self._cleanup_task
-            except asyncio.CancelledError:
-                pass
-        logger.info(f"指令冲突检测管理器已停止 | Bot={self._current_bot_id}")
-
-    def register_bot(self, bot_id: str, bot_name: str, priority: int = 0):
-        """注册Bot信息
-        
-        Args:
-            bot_id: Bot唯一标识
-            bot_name: Bot名称
-            priority: 优先级（数字越大优先级越高）
-        """
-        if bot_id not in self._bot_registry:
-            self._bot_registry[bot_id] = BotInfo(
-                bot_id=bot_id,
-                bot_name=bot_name,
-                priority=priority
-            )
-            logger.info(f"注册Bot: {bot_name} ({bot_id}) | 优先级={priority}")
-
-    async def check_and_handle_command(
-        self,
-        command: str,
-        group_id: str,
-        sender_id: str,
-        bot_id: str,
-        event_id: str = ""
-    ) -> Tuple[bool, Optional[ConflictEvent]]:
-        """检查并处理指令冲突
-        
-        使用基于消息哈希的确定性选择策略，确保在多Bot环境下所有Bot
-        独立做出一致的决策。
-        
-        Args:
-            command: 指令名称
-            group_id: 群组ID
-            sender_id: 发送者ID
-            bot_id: 当前Bot ID
-            event_id: 事件ID
-            
-        Returns:
-            元组 (是否允许执行, 冲突事件)
-        """
-        async with self._lock:
-            current_time = get_current_timestamp()
-            command_key = generate_command_key(group_id, command, sender_id)
-            
-            existing_record = self._command_cache.get(command_key)
-            
-            # 情况1：缓存中没有该指令，这是第一个Bot收到
-            if existing_record is None:
-                record = CommandRecord(
-                    command=command,
-                    group_id=group_id,
-                    sender_id=sender_id,
-                    bot_id=bot_id,
-                    timestamp=current_time,
-                    status=CommandStatus.EXECUTING,
-                    event_id=event_id
-                )
-                await self._add_to_cache(command_key, record)
-                
-                if self.config.enable_logging:
-                    logger.info(format_log_message("新指令", {
-                        "command": command,
-                        "group": group_id,
-                        "sender": sender_id,
-                        "bot": bot_id
-                    }))
-                
-                # 第一个收到指令的Bot，使用确定性算法决定是否执行
-                should_execute = await self._deterministic_select(
-                    command_key=command_key,
-                    command=command,
-                    group_id=group_id,
-                    sender_id=sender_id,
-                    current_time=current_time,
-                    bot_id=bot_id
-                )
-                
-                if not should_execute:
-                    record.status = CommandStatus.BLOCKED
-                
-                return should_execute, None
-            
-            # 情况2：缓存中有该指令，检查时间窗口
-            time_diff = current_time - existing_record.timestamp
-            
-            # 如果时间窗口已过或指令已完成，重置状态
-            if time_diff > self.config.time_window or existing_record.status == CommandStatus.COMPLETED:
-                existing_record.bot_id = bot_id
-                existing_record.timestamp = current_time
-                existing_record.status = CommandStatus.EXECUTING
-                existing_record.event_id = event_id
-                
-                self._command_cache.move_to_end(command_key)
-                
-                # 重新使用确定性算法选择
-                should_execute = await self._deterministic_select(
-                    command_key=command_key,
-                    command=command,
-                    group_id=group_id,
-                    sender_id=sender_id,
-                    current_time=current_time,
-                    bot_id=bot_id
-                )
-                
-                if not should_execute:
-                    existing_record.status = CommandStatus.BLOCKED
-                
-                return should_execute, None
-            
-            # 情况3：在时间窗口内，且指令正在执行中，需要处理冲突
-            conflict_event = await self._handle_conflict(
-                command_key=command_key,
-                existing_record=existing_record,
-                new_bot_id=bot_id,
-                current_time=current_time
-            )
-            
-            should_execute = (conflict_event and conflict_event.selected_bot_id == bot_id)
-            
-            if not should_execute:
-                blocked_record = CommandRecord(
-                    command=command,
-                    group_id=group_id,
-                    sender_id=sender_id,
-                    bot_id=bot_id,
-                    timestamp=current_time,
-                    status=CommandStatus.BLOCKED,
-                    event_id=event_id
-                )
-                await self._add_to_cache(f"{command_key}_blocked_{bot_id}", blocked_record)
-            
-            return should_execute, conflict_event
-
-    async def _deterministic_select(
-        self,
-        command_key: str,
-        command: str,
-        group_id: str,
-        sender_id: str,
-        current_time: float,
-        bot_id: str
-    ) -> bool:
-        """基于哈希的确定性选择
-        
-        使用消息内容的哈希值来确定性选择是否执行，确保在多Bot环境下
-        所有Bot独立做出一致的决策。
-        
-        Args:
-            command_key: 指令键
-            command: 指令名称
-            group_id: 群组ID
-            sender_id: 发送者ID
-            current_time: 当前时间戳
-            bot_id: 当前Bot ID
-            
-        Returns:
-            是否允许执行
-        """
-        strategy = BotSelectionStrategy(self.config.bot_selection_strategy)
-        
-        if strategy == BotSelectionStrategy.RANDOM:
-            # 基于消息哈希的伪随机选择
-            # 使用当前时间窗口（秒级）作为种子的一部分
-            time_seed = int(current_time / self.config.time_window)
-            hash_input = f"{command_key}:{time_seed}:{group_id}"
-            hash_value = int(hashlib.md5(hash_input.encode()).hexdigest(), 16)
-            
-            # 假设有4个Bot，使用哈希值对4取模来决定哪个Bot执行
-            # 这里我们使用Bot ID的哈希来映射到0-3的范围
-            bot_hash = int(hashlib.md5(bot_id.encode()).hexdigest(), 16) % 4
-            selected = hash_value % 4
-            
-            should_execute = (bot_hash == selected)
-            
-            if self.config.enable_logging:
-                logger.debug(format_log_message("随机选择", {
-                    "command": command,
-                    "bot_hash": bot_hash,
-                    "selected": selected,
-                    "execute": should_execute
-                }))
-            
-            return should_execute
-        
-        elif strategy == BotSelectionStrategy.ROUND_ROBIN:
-            # 基于时间窗口的轮询
-            # 将时间划分为时间窗口大小的槽位
-            time_slot = int(current_time / self.config.time_window)
-            key = f"{group_id}:{command}:{time_slot}"
-            
-            # 获取或初始化计数器
-            if key not in self._round_robin_counter:
-                self._round_robin_counter[key] = 0
-            else:
-                self._round_robin_counter[key] += 1
-            
-            # 使用Bot ID的哈希作为Bot的序号（假设最多10个Bot）
-            bot_index = int(hashlib.md5(bot_id.encode()).hexdigest(), 16) % 10
-            counter = self._round_robin_counter[key]
-            
-            # 轮询：计数器对10取模，等于Bot序号的执行
-            should_execute = (counter % 10 == bot_index)
-            
-            if self.config.enable_logging:
-                logger.debug(format_log_message("轮询选择", {
-                    "command": command,
-                    "bot_index": bot_index,
-                    "counter": counter,
-                    "execute": should_execute
-                }))
-            
-            return should_execute
-        
-        elif strategy == BotSelectionStrategy.PRIORITY:
-            # 优先级策略：默认允许执行，依赖外部配置
-            # 这里简化处理，总是允许第一个收到的Bot执行
-            return True
-        
-        # 默认允许执行
-        return True
-
-    async def _handle_conflict(
-        self,
-        command_key: str,
-        existing_record: CommandRecord,
-        new_bot_id: str,
-        current_time: float
-    ) -> Optional[ConflictEvent]:
-        """处理指令冲突
-        
-        Args:
-            command_key: 指令键
-            existing_record: 已存在的指令记录
-            new_bot_id: 新请求的Bot ID
-            current_time: 当前时间戳
-            
-        Returns:
-            冲突事件对象
-        """
-        all_bots = [existing_record.bot_id]
-        if new_bot_id not in all_bots:
-            all_bots.append(new_bot_id)
-        
-        # 使用确定性选择
-        selected_bot = await self._select_bot_deterministic(
-            all_bots, existing_record.group_id, existing_record.command, current_time
-        )
-        
-        blocked_bots = [bot for bot in all_bots if bot != selected_bot]
-        
-        conflict_event = ConflictEvent(
-            command=existing_record.command,
-            group_id=existing_record.group_id,
-            timestamp=current_time,
-            selected_bot_id=selected_bot,
-            blocked_bots=blocked_bots,
-            total_bots=len(all_bots)
-        )
-        
-        self._record_conflict(conflict_event)
-        
-        if self.config.enable_logging:
-            selected_bot_name = self._get_bot_name(selected_bot)
-            blocked_names = [self._get_bot_name(bot) for bot in blocked_bots]
-            
-            logger.info(format_log_message("指令冲突", {
-                "command": existing_record.command,
-                "group": existing_record.group_id,
-                "selected": f"{selected_bot_name}({selected_bot})",
-                "blocked": ",".join([f"{n}({b})" for n, b in zip(blocked_names, blocked_bots)]),
-                "total": len(all_bots)
-            }))
-        
-        return conflict_event
-
-    async def _select_bot_deterministic(
-        self,
-        bot_ids: List[str],
-        group_id: str,
-        command: str,
-        current_time: float
-    ) -> str:
-        """确定性选择Bot
-        
-        使用基于消息哈希的确定性算法，确保所有Bot做出一致的选择。
-        
-        Args:
-            bot_ids: 候选Bot ID列表
-            group_id: 群组ID
-            command: 指令名称
-            current_time: 当前时间戳
-            
-        Returns:
-            被选中的Bot ID
-        """
-        if not bot_ids:
-            return ""
-        
-        if len(bot_ids) == 1:
-            return bot_ids[0]
-        
-        strategy = BotSelectionStrategy(self.config.bot_selection_strategy)
-        
-        if strategy == BotSelectionStrategy.RANDOM:
-            # 基于哈希的伪随机选择
-            time_seed = int(current_time / self.config.time_window)
-            hash_input = f"{group_id}:{command}:{time_seed}"
-            hash_value = int(hashlib.md5(hash_input.encode()).hexdigest(), 16)
-            
-            # 对Bot列表排序后选择
-            sorted_bots = sorted(bot_ids)
-            selected_index = hash_value % len(sorted_bots)
-            return sorted_bots[selected_index]
-        
-        elif strategy == BotSelectionStrategy.ROUND_ROBIN:
-            # 基于时间窗口的轮询
-            time_slot = int(current_time / self.config.time_window)
-            key = f"{group_id}:{command}:{time_slot}"
-            
-            if key not in self._round_robin_counter:
-                self._round_robin_counter[key] = 0
-            
-            counter = self._round_robin_counter[key]
-            sorted_bots = sorted(bot_ids)
-            selected_index = counter % len(sorted_bots)
-            
-            self._round_robin_counter[key] += 1
-            return sorted_bots[selected_index]
-        
-        elif strategy == BotSelectionStrategy.PRIORITY:
-            # 优先级选择
-            bot_with_priority = [
-                (bot_id, self._bot_registry.get(bot_id, BotInfo(bot_id, "", 0)).priority)
-                for bot_id in bot_ids
-            ]
-            bot_with_priority.sort(key=lambda x: (-x[1], x[0]))  # 先按优先级降序，再按ID升序
-            return bot_with_priority[0][0]
-        
-        return bot_ids[0]
-
-    async def _add_to_cache(self, key: str, record: CommandRecord):
-        """添加记录到缓存
-        
-        Args:
-            key: 缓存键
-            record: 指令记录
-        """
-        self._command_cache[key] = record
-        self._command_cache.move_to_end(key)
-        
-        while len(self._command_cache) > self.config.max_cache_size:
-            self._command_cache.popitem(last=False)
-
-    def mark_command_completed(self, command: str, group_id: str, sender_id: str):
-        """标记指令为已完成
-        
-        Args:
-            command: 指令名称
-            group_id: 群组ID
-            sender_id: 发送者ID
-        """
-        command_key = generate_command_key(group_id, command, sender_id)
-        if command_key in self._command_cache:
-            self._command_cache[command_key].status = CommandStatus.COMPLETED
-
-    def _record_conflict(self, event: ConflictEvent):
-        """记录冲突事件
-        
-        Args:
-            event: 冲突事件
-        """
-        self._conflict_history.append(event)
-        
-        while len(self._conflict_history) > self._max_history_size:
-            self._conflict_history.pop(0)
-
-    def get_conflict_history(self, limit: int = 50) -> List[ConflictEvent]:
-        """获取冲突历史记录
-        
-        Args:
-            limit: 返回的最大条数
-            
-        Returns:
-            冲突事件列表
-        """
-        return self._conflict_history[-limit:]
-
-    def get_statistics(self) -> Dict[str, Any]:
-        """获取统计信息
-        
-        Returns:
-            包含统计信息的字典
-        """
-        total_conflicts = len(self._conflict_history)
-        
-        if total_conflicts == 0:
-            return {
-                "total_conflicts": 0,
-                "cache_size": len(self._command_cache),
-                "registered_bots": len(self._bot_registry),
-                "top_conflicted_commands": []
-            }
-        
-        command_counts: Dict[str, int] = {}
-        for event in self._conflict_history:
-            command_counts[event.command] = command_counts.get(event.command, 0) + 1
-        
-        top_commands = sorted(
-            command_counts.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )[:10]
-        
-        return {
-            "total_conflicts": total_conflicts,
-            "cache_size": len(self._command_cache),
-            "registered_bots": len(self._bot_registry),
-            "top_conflicted_commands": top_commands
+        self.stats: Dict[str, Any] = {
+            "total_allowed": 0,
+            "blocked_same_conversation": 0,
+            "blocked_cross_platform": 0,
+            "cross_events": [],  # 最近跨平台拦截记录
         }
 
-    async def _cleanup_loop(self):
-        """定期清理循环"""
-        while self._running:
-            try:
-                await asyncio.sleep(self.config.cleanup_interval)
-                await self._cleanup_expired_records()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"清理任务出错: {e}", exc_info=True)
+    # ------------------------------------------------------------------
+    # 对外接口
+    # ------------------------------------------------------------------
 
-    async def _cleanup_expired_records(self):
-        """清理过期的指令记录"""
-        async with self._lock:
-            current_time = get_current_timestamp()
-            expired_keys = []
-            
-            for key, record in self._command_cache.items():
-                if current_time - record.timestamp > COMMAND_CACHE_TTL:
-                    expired_keys.append(key)
-            
-            for key in expired_keys:
-                del self._command_cache[key]
-            
-            if expired_keys and self.config.enable_logging:
-                logger.debug(f"清理了 {len(expired_keys)} 条过期记录")
+    async def check(self, info: MessageInfo) -> Tuple[bool, str]:
+        """判定一条群消息是否放行
 
-    def _get_bot_name(self, bot_id: str) -> str:
-        """获取Bot名称
-        
         Args:
-            bot_id: Bot ID
-            
+            info: 从事件提取的判定信息
+
         Returns:
-            Bot名称或Bot ID
+            (是否放行, 拦截原因描述)
         """
-        bot_info = self._bot_registry.get(bot_id)
-        return bot_info.bot_name if bot_info else bot_id
+        self._sweep_if_needed(get_current_timestamp())
+
+        fingerprint = ""
+        if self._cross_enabled_for(info):
+            fingerprint = content_fingerprint(info.message_str)
+        key1 = generate_command_key(info.group_id, info.command, info.sender_id)
+
+        async with self._lock:
+            now = get_current_timestamp()
+
+            # ---- 层1：同会话精确去重（同平台多账号） ----
+            existing = self._layer1.get(key1)
+            if existing is not None:
+                ts, woken = existing
+                if now - ts <= self.config.time_window:
+                    if woken or not info.woken:
+                        self.stats["blocked_same_conversation"] += 1
+                        return False, "同会话重复消息"
+                    # 已有弱记录而当前事件是唤醒事件：不拦截，
+                    # 落记录时会升级为强记录（真正要响应的机器人到达了）
+                else:
+                    del self._layer1[key1]
+
+            # ---- 层2：跨平台指纹去重 ----
+            if fingerprint:
+                matched = await self._find_cross_match(info, fingerprint, now)
+                if matched is not None:
+                    self._record_cross_block(info, matched)
+                    return False, self._describe_match(matched)
+
+            # ---- 决策延迟：给更高优先级平台一个先登记的机会 ----
+            # 注意：不能在锁内 sleep，否则对方事件连 check 都进不来。
+            if not (fingerprint and await self._should_delay(info.platform_name)):
+                self._record_allow(info, key1, fingerprint)
+                return True, ""
+
+        # 延迟等待期间不持锁；醒来后重新扫描再决策
+        await asyncio.sleep(self.config.decision_delay_ms / 1000.0)
+        async with self._lock:
+            matched = await self._find_cross_match(
+                info, fingerprint, get_current_timestamp()
+            )
+            if matched is not None:
+                self._record_cross_block(info, matched)
+                return False, self._describe_match(matched)
+            self._record_allow(info, key1, fingerprint)
+            return True, ""
+
+    # ------------------------------------------------------------------
+    # 层1 辅助
+    # ------------------------------------------------------------------
+
+    def _record_allow(self, info: MessageInfo, key1: str, fingerprint: str) -> None:
+        now = get_current_timestamp()
+        self._layer1[key1] = (now, info.woken)
+        if fingerprint:
+            records = self._fingerprints.setdefault(fingerprint, [])
+            records.append(
+                FingerprintRecord(
+                    platform_name=info.platform_name,
+                    platform_id=info.platform_id,
+                    self_id=info.self_id,
+                    group_id=info.group_id,
+                    group_name=info.group_name,
+                    sender_id=info.sender_id,
+                    fingerprint=fingerprint,
+                    woken=info.woken,
+                    timestamp=now,
+                )
+            )
+            self._fingerprints.move_to_end(fingerprint)
+            self._cap_fingerprints()
+        self.stats["total_allowed"] += 1
+
+    # ------------------------------------------------------------------
+    # 层2 辅助
+    # ------------------------------------------------------------------
+
+    def _cross_enabled_for(self, info: MessageInfo) -> bool:
+        """判断该事件是否参与跨平台去重"""
+        if not self.config.cross_platform_dedup:
+            return False
+        if info.platform_name not in self._qq_family_platforms():
+            return False
+        # qq_official 系平台的群消息 group_id 是 group_openid（含字母），
+        # 频道消息的 group_id 是纯数字 channel_id；OneBot 无法出现在频道，
+        # 与频道消息做内容匹配必然是误判，直接跳过。
+        if info.platform_name.startswith("qq_official") and info.group_id.isdigit():
+            return False
+        return True
+
+    def _qq_family_platforms(self) -> List[str]:
+        return [
+            p.strip()
+            for p in self.config.cross_platform_platforms.split(",")
+            if p.strip()
+        ]
+
+    def _priority_list(self) -> List[str]:
+        return [
+            p.strip()
+            for p in self.config.platform_priority.split(",")
+            if p.strip()
+        ]
+
+    async def _find_cross_match(
+        self, info: MessageInfo, fingerprint: str, now: float
+    ) -> Optional[FingerprintRecord]:
+        """在指纹记录中查找与当前事件冲突的记录
+
+        匹配规则：
+        1. 唤醒分级：强记录可拦截任何事件；弱记录只拦截非唤醒事件。
+        2. 跨平台（platform_name 不同）：群名锚定——若双方群名都已知且
+           不同，视为不同群，不构成冲突；否则视为同消息冲突。
+        3. 同平台不同会话：仅当双方群名都已知且相同（几乎必为同群）时
+           才视为冲突，其余放行交给层1处理。
+        4. 同平台同会话：视为冲突（覆盖层1窗口外但跨平台窗口内的场景）。
+        """
+        records = self._fingerprints.get(fingerprint)
+        if not records:
+            return None
+
+        window = self.config.cross_platform_time_window
+        for record in records:
+            if now - record.timestamp > window:
+                continue
+            if record.woken is False and info.woken:
+                # 弱记录不压制唤醒事件
+                continue
+            if record.platform_name == info.platform_name:
+                same_conversation = (
+                    record.group_id == info.group_id
+                    and record.sender_id == info.sender_id
+                )
+                if same_conversation:
+                    return record
+                if self.config.use_group_name_anchor:
+                    name_a = record.group_name or await self._resolve_group_name(record)
+                    if name_a and info.group_name and name_a == info.group_name:
+                        return record
+                continue
+            # 不同平台
+            if self.config.use_group_name_anchor and info.group_name:
+                name_a = record.group_name or await self._resolve_group_name(record)
+                if name_a and name_a != info.group_name:
+                    # 群名不同 → 不同的群，非重复
+                    continue
+            return record
+        return None
+
+    async def _resolve_group_name(self, record: FingerprintRecord) -> str:
+        """解析记录对应群名（仅支持 OneBot 系平台，带缓存）
+
+        QQ 官方侧的群名在事件到达时已由适配器尽力填充；OneBot 侧事件通常
+        不带群名，需要时通过 get_group_info 查询。
+        """
+        if not record.platform_name.startswith("aiocqhttp"):
+            return record.group_name
+        cache_key = f"{record.platform_id}:{record.group_id}"
+        now = get_current_timestamp()
+        cached = self._group_name_cache.get(cache_key)
+        if cached and cached[0] > now:
+            return cached[1]
+
+        name = ""
+        try:
+            inst = None
+            if self._context is not None and hasattr(self._context, "get_platform_inst"):
+                inst = self._context.get_platform_inst(record.platform_id)
+            bot = getattr(inst, "bot", None)
+            if bot is not None and hasattr(bot, "call_action"):
+                result = await asyncio.wait_for(
+                    bot.call_action("get_group_info", group_id=int(record.group_id)),
+                    timeout=GROUP_NAME_RESOLVE_TIMEOUT,
+                )
+                if isinstance(result, dict):
+                    name = str(result.get("group_name") or "")
+        except Exception as e:
+            logger.debug(f"[BDM] 查询群名失败 group={record.group_id}: {e}")
+
+        ttl = GROUP_NAME_CACHE_TTL if name else GROUP_NAME_FAILURE_TTL
+        self._group_name_cache[cache_key] = (now + ttl, name)
+        return name
+
+    async def _should_delay(self, platform_name: str) -> bool:
+        """是否需要为更高优先级平台等待决策
+
+        条件：配置了 platform_priority 与 decision_delay_ms，且当前已连接
+        的 QQ 系平台中存在比本平台优先级更高的平台。
+        """
+        if self.config.decision_delay_ms <= 0:
+            return False
+        priorities = self._priority_list()
+        if not priorities or platform_name not in priorities:
+            return False
+        try:
+            instances = self._context.platform_manager.platform_insts
+            connected = {p.meta().name for p in instances}
+        except Exception:
+            return False
+        for candidate in priorities:
+            if candidate == platform_name:
+                return False
+            if candidate in connected:
+                return True
+        return False
+
+    def _describe_match(self, record: FingerprintRecord) -> str:
+        if record.platform_name == "":
+            return "重复消息"
+        return f"跨平台重复(vs {record.platform_name})"
+
+    def _record_cross_block(self, info: MessageInfo, matched: FingerprintRecord) -> None:
+        self.stats["blocked_cross_platform"] += 1
+        event_desc = {
+            "platform": info.platform_name,
+            "vs_platform": matched.platform_name,
+            "group_id": info.group_id,
+            "sender_id": info.sender_id,
+            "message": info.message_str[:40],
+            "timestamp": get_current_timestamp(),
+        }
+        self.stats["cross_events"].append(event_desc)
+        if len(self.stats["cross_events"]) > 50:
+            self.stats["cross_events"].pop(0)
+        if self.config.enable_logging:
+            logger.info(
+                format_log_message("跨平台拦截", {
+                    "platform": info.platform_name,
+                    "vs": matched.platform_name,
+                    "group": info.group_id,
+                    "sender": info.sender_id,
+                    "msg": info.message_str[:30],
+                })
+            )
+
+    # ------------------------------------------------------------------
+    # 缓存维护
+    # ------------------------------------------------------------------
+
+    def _cap_fingerprints(self) -> None:
+        """限制指纹缓存容量并清理过期记录"""
+        while len(self._fingerprints) > self.config.max_cache_size:
+            self._fingerprints.popitem(last=False)
+
+    def _sweep_if_needed(self, now: float) -> None:
+        """周期性清扫过期缓存（每 SWEEP_INTERVAL_OPS 次操作一次）"""
+        self._ops_since_sweep += 1
+        if self._ops_since_sweep < SWEEP_INTERVAL_OPS:
+            return
+        self._ops_since_sweep = 0
+
+        layer1_ttl = max(self.config.time_window, 10.0) * 2
+        expired = [
+            key for key, (ts, _) in self._layer1.items() if now - ts > layer1_ttl
+        ]
+        for key in expired:
+            del self._layer1[key]
+
+        window = self.config.cross_platform_time_window
+        for fingerprint in list(self._fingerprints.keys()):
+            records = [
+                r for r in self._fingerprints[fingerprint] if now - r.timestamp <= window
+            ]
+            if records:
+                self._fingerprints[fingerprint] = records
+            else:
+                del self._fingerprints[fingerprint]
+
+        for cache_key in list(self._group_name_cache.keys()):
+            if self._group_name_cache[cache_key][0] <= now:
+                del self._group_name_cache[cache_key]
+
+    def get_status_summary(self) -> Dict[str, Any]:
+        """获取运行状态摘要（供状态指令使用）"""
+        return {
+            "total_allowed": self.stats["total_allowed"],
+            "blocked_same_conversation": self.stats["blocked_same_conversation"],
+            "blocked_cross_platform": self.stats["blocked_cross_platform"],
+            "layer1_size": len(self._layer1),
+            "fingerprint_size": len(self._fingerprints),
+            "cross_platform_enabled": self.config.cross_platform_dedup,
+            "qq_family": self._qq_family_platforms(),
+        }
+
+    def clear(self) -> None:
+        """清空全部缓存"""
+        self._layer1.clear()
+        self._fingerprints.clear()
+        self._group_name_cache.clear()
