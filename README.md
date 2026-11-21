@@ -1,7 +1,7 @@
 # 多Bot指令冲突解决器 (astrbot_plugin_block_duplicate_messages)
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-v3.4+-blue.svg)](https://github.com/AstrBotDevs/AstrBot)
-[![Version](https://img.shields.io/badge/version-2.1.0-green.svg)](https://github.com/yaohewoma/astrbot_plugin_block_duplicate_messages)
+[![Version](https://img.shields.io/badge/version-2.1.1-green.svg)](https://github.com/yaohewoma/astrbot_plugin_block_duplicate_messages)
 [![License](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 
 > 解决多Bot同时响应相同指令导致的刷屏问题。v2.1 起同时支持 **同平台多账号**（多个 OneBot v11 连接）与 **跨平台共群**（OneBot v11 + QQ 官方 API）两种冲突场景的去重。
@@ -105,6 +105,11 @@ git clone https://github.com/yaohewoma/astrbot_plugin_block_duplicate_messages.g
 注意：多个 bot 必须连接在**同一个 AstrBot 实例**中（本插件在进程内去重）。跨 AstrBot 实例的冲突无法由本插件处理。
 
 ## 📝 更新日志
+
+### v2.1.1 (2026-11-21)
+- 🐛 修复 QQ 官方卡片（小程序 / 图文卡片）与 OneBot JSON 卡片在多个 Bot 共群时重复响应的问题
+- ✨ 卡片消息优先按预览图链接生成统一指纹，跨平台字段顺序和摘要差异不再影响匹配
+- ✨ 无文本的图片、视频和文件消息使用附件地址作为内容指纹
 
 ### v2.1.0 (2026-10-25)
 - ✨ 新增跨平台去重：解决 OneBot v11 与 QQ 官方 API（qq_official）共群时同一消息双响应的问题

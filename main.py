@@ -1,5 +1,7 @@
 
 
+
+import re
 from typing import AsyncGenerator, Any
 
 from astrbot.api.event import filter, AstrMessageEvent
@@ -13,7 +15,7 @@ from .models import MessageInfo, PluginConfig
 from .utils import handle_errors, extract_command
 
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 __author__ = "yonglanws"
 
 
@@ -129,11 +131,49 @@ class BlockDuplicateMessagesPlugin(Star):
         except Exception as e:
             logger.error(f"[BDM] 处理消息时出错: {e}", exc_info=True)
 
+    _CARD_TEXT_PATTERN = re.compile(r"preview:\s*(https?://\S+)", re.IGNORECASE)
+    _CARD_PREVIEW_PATTERN = re.compile(
+        r"""["']preview["']\s*:\s*["']([^"']+)["']""",
+        re.IGNORECASE,
+    )
+    _CARD_JUMP_PATTERN = re.compile(
+        r"""["'](?:qqdocurl|jumpUrl)["']\s*:\s*["']([^"']+)["']""",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _normalize_card_url(cls, url: str) -> str:
+        """统一卡片链接中的转义与 HTML 实体，便于跨平台比对。"""
+        return (
+            re.sub(r"\\+/", "/", str(url or "").strip())
+            .replace("&amp;", "&")
+        )
+
+    @classmethod
+    def _extract_card_url(cls, content: str) -> str:
+        """从 QQ 卡片文本或 JSON 中提取稳定的预览/跳转链接。"""
+        text = str(content or "")
+        for pattern in (
+            cls._CARD_TEXT_PATTERN,
+            cls._CARD_PREVIEW_PATTERN,
+            cls._CARD_JUMP_PATTERN,
+        ):
+            match = pattern.search(text)
+            if match:
+                url = cls._normalize_card_url(match.group(1))
+                if url:
+                    return url
+        return ""
+
     def _extract_message_content(self, event: AstrMessageEvent) -> str:
         """提取消息内容，支持多种组件类型"""
         # 首先尝试获取普通文本
         message_str = (event.message_str or "").strip()
-        if message_str:
+        if message_str and message_str not in ("[Json]", "[JSON]"):
+            if message_str.startswith("[卡片消息]"):
+                card_url = self._extract_card_url(message_str)
+                if card_url:
+                    return f"[卡片]{card_url}"
             return message_str
 
         # 检查消息链中的JSON组件
@@ -143,9 +183,18 @@ class BlockDuplicateMessagesPlugin(Star):
                 if comp_type and 'json' in str(comp_type).lower():
                     json_content = getattr(component, 'data', None) or getattr(component, 'content', None)
                     if json_content:
+                        card_url = self._extract_card_url(str(json_content))
+                        if card_url:
+                            return f"[卡片]{card_url}"
                         return f"[JSON]{json_content}"
 
-        return ""
+            # QQ 官方卡片等消息没有文本，预览图和附件地址仍可用于内容指纹。
+            for component in event.message_obj.message:
+                url = getattr(component, 'url', None) or getattr(component, 'file', None)
+                if url and str(url).lower().startswith(('http://', 'https://')):
+                    return f"[附件]{url}"
+
+        return message_str
 
     async def _handle_message(self, event: AstrMessageEvent):
         """处理单条消息的核心逻辑"""
@@ -153,6 +202,8 @@ class BlockDuplicateMessagesPlugin(Star):
         message_str = self._extract_message_content(event)
         if not message_str:
             return
+        if message_str.startswith("[卡片]"):
+            logger.debug(f"[BDM] 卡片指纹: {message_str[:120]}")
 
         # 提取指令/消息标识
         command = extract_command(message_str)
