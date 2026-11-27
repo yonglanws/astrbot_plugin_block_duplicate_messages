@@ -113,6 +113,11 @@ class DuplicateMessageFilter:
 
             # ---- 决策延迟：给更高优先级平台一个先登记的机会 ----
             # 注意：不能在锁内 sleep，否则对方事件连 check 都进不来。
+            # 非指令且未唤醒当前 bot 的群聊流水消息不需要等待决策延迟，避免无谓阻塞。
+            is_command = (info.message_str or "").lstrip().startswith("/")
+            if not info.woken and not is_command:
+                self._record_allow(info, key1, fingerprint)
+                return True, ""
             if not (fingerprint and await self._should_delay(info.platform_name)):
                 self._record_allow(info, key1, fingerprint)
                 return True, ""
